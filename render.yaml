@@ -1,0 +1,21 @@
+# One-click setup on Render: Dashboard > New > Blueprint > pick this repo.
+# Render asks for the two keys below; they are stored on Render only, never in this public repo.
+services:
+  - type: web
+    name: care-home-voice
+    runtime: node
+    rootDir: server
+    plan: free
+    region: frankfurt
+    buildCommand: echo "no build step"
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://neiltheaussie.github.io
+      - key: DAILY_CAP
+        value: "400"

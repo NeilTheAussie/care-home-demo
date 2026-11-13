@@ -1,0 +1,9 @@
+{
+  "name": "care-home-voice",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Voice server for the care home demo: ElevenLabs Scribe transcription + Claude write-up",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" }
+}
