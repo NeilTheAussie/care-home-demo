@@ -19,10 +19,15 @@ if (-not $up) {
 }
 
 # 2. quick tunnel (a new one each run; stop any old one first)
-Get-Process cloudflared -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'localhost:3402' } | Stop-Process -Force -ErrorAction SilentlyContinue
+# Only ever stops the tunnel pointing at the voice service, never the reports tunnel.
+Get-CimInstance Win32_Process -Filter "Name='cloudflared.exe'" | Where-Object { $_.CommandLine -match 'localhost:3402' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 1
 $cf = 'C:\Program Files (x86)\cloudflared\cloudflared.exe'
+# An empty config so the reports tunnel's ~/.cloudflared/config.yml (its ingress rules) is not applied to this quick tunnel.
+$emptyCfg = Join-Path $logs 'quick-tunnel.yml'
+[IO.File]::WriteAllText($emptyCfg, "# quick tunnel for the voice service`n")
 if (Test-Path "$logs\tunnel.log") { Remove-Item "$logs\tunnel.log" -Force }
-Start-Process $cf -ArgumentList 'tunnel', '--no-autoupdate', '--url', 'http://localhost:3402' -WindowStyle Hidden -RedirectStandardOutput "$logs\tunnel.out" -RedirectStandardError "$logs\tunnel.log"
+Start-Process $cf -ArgumentList 'tunnel', '--config', "`"$emptyCfg`"", '--no-autoupdate', '--url', 'http://localhost:3402' -WindowStyle Hidden -RedirectStandardOutput "$logs\tunnel.out" -RedirectStandardError "$logs\tunnel.log"
 $url = $null
 for ($i = 0; $i -lt 60 -and -not $url; $i++) {
   Start-Sleep -Seconds 1
