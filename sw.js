@@ -1,7 +1,7 @@
 // Offline support: the app shell is cached so the demo opens with no signal.
 // Network first for the app files (so updates arrive), cache as fallback.
-const CACHE = 'care-demo-v1';
-const SHELL = ['./', 'index.html', 'app.css?v=1', 'app.js?v=1', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
+const CACHE = 'care-demo-v3';
+const SHELL = ['./', 'index.html', 'app.css?v=3', 'app.js?v=3', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

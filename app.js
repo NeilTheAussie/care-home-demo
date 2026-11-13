@@ -300,7 +300,7 @@ function normalise(text) {
   t = t.replace(/(\d),(\d{3})/g, '$1$2');
   t = wordsToDigits(t);
   t = t.replace(/\bminus\s+(\d)/gi, '-$1').replace(/(\d)\s*°\s*c?\b/gi, '$1 degrees').replace(/(\d)\s*°/g, '$1 degrees');
-  t = t.replace(/(\d)\s*(millilitres?|milliliters?|mls?|mL)\b/gi, '$1 ml');
+  t = t.replace(/(\d)\s*(millilitres?|milliliters?|mls?|mils?|mL)\b/gi, '$1 ml');
   t = t.replace(/(\d)\s*(kilograms?|kilos?|kgs?)\b/gi, '$1 kg');
   return t.replace(/\s+/g, ' ').trim();
 }
@@ -367,6 +367,40 @@ function parseSpeech(text, residents) {
   for (const [k, re] of CONCERN) if (re.test(low)) { p.type = 'concern'; p.concern = k; return p; }
   return p;
 }
+// Split a note that covers several residents or several things into separate entries.
+// "Glenys drank 200 ml, and Hywel was turned. He seemed agitated." -> Glenys fluids, Hywel turned, Hywel behaviour.
+function splitLocal(text, residents) {
+  const sentences = String(text || '').split(/(?<=[.!?;])\s+/).map(s => s.trim()).filter(Boolean);
+  const chunks = [];
+  sentences.forEach(s => {
+    const parts = s.split(/,?\s+\b(?:and|but|also|then|while)\b\s+/i);
+    let cur = parts[0];
+    for (let i = 1; i < parts.length; i++) {
+      const nextRes = findResident(parts[i], residents), curRes = findResident(cur, residents);
+      const startsPronoun = /^(he|she|they|his|her|their)\b/i.test(parts[i]);
+      const nextHasOwnThing = parseSpeech(parts[i], residents).type !== 'note';
+      if ((nextRes && (!curRes || nextRes.id !== curRes.id)) || startsPronoun || nextHasOwnThing) { chunks.push(cur); cur = parts[i]; }
+      else cur += ' and ' + parts[i];
+    }
+    chunks.push(cur);
+  });
+  const out = []; let last = null;
+  chunks.forEach(c => {
+    const p = parseSpeech(c, residents);
+    if (!p.resId && last && !['temp', 'waste'].includes(p.type)) p.resId = last;
+    if (p.resId) last = p.resId;
+    const prev = out[out.length - 1];
+    if (p.type === 'note' && prev && prev.type === 'note' && prev.resId === p.resId) { prev.chunk += ' ' + c; return; }
+    if (p.type === 'note' && prev && ['fall', 'concern'].includes(prev.type) && prev.resId === p.resId) {
+      prev.chunk += ' ' + c;
+      if (prev.type === 'fall') prev.injury = parseSpeech(prev.chunk, residents).injury;
+      return;
+    }
+    p.chunk = c; out.push(p);
+  });
+  out.forEach(p => { p.writeText = ['temp', 'waste'].includes(p.type) ? '' : tidy(p.chunk); });
+  return out;
+}
 const CONCERN_LABEL = { medicine: 'Medicine refused', skin: 'Skin or pressure area', eating: 'Not eating or drinking', unwell: 'Unwell', behaviour: 'Behaviour', safeguarding: 'Safeguarding', other: 'Other concern' };
 const TYPE_LABEL = { note: 'Daily note', fluids: 'Fluids', turned: 'Repositioned', fall: 'Fall', concern: 'Concern', weight: 'Weight', temp: 'Fridge or freezer temperature', waste: 'Food waste' };
 
@@ -381,7 +415,7 @@ function tidy(text) {
 function writeUp(p, r, extra) {
   const lines = [];
   const who = r ? resName(r) + ' (room ' + r.room + ')' : '';
-  const body = tidy(p.text);
+  const body = p.writeText ? String(p.writeText).trim() : tidy(p.text);
   if (p.type === 'temp') return (p.appliance || 'Fridge') + ': ' + (p.temp == null ? '?' : p.temp) + '\u00b0C' + (p.temp != null && tempBad({ unit: p.appliance, temp: p.temp }) ? '. OUT OF SAFE RANGE. Manager alerted.' : '. Within safe range.');
   if (p.type === 'waste') return 'Food waste: ' + (p.qty || 1) + ' ' + (p.unit || 'portions') + (p.item ? ' of ' + p.item : '') + '. Reason: ' + (p.reason || 'Other') + '.';
   if (who) lines.push(who + ', ' + hhmm(Date.now()) + '.');
@@ -415,9 +449,10 @@ function fileEntry(h, p, by) {
   if (p.type === 'weight' && p.kg) r.weights.push({ ts: now, kg: Number(p.kg) });
   if (p.type === 'fall' || p.type === 'concern') {
     const type = p.type === 'fall' ? 'Fall' : (CONCERN_LABEL[p.concern] || 'Concern');
-    const inc = { id: uid(), ts: now, resId: r.id, type: p.type === 'fall' ? 'Fall' : 'Concern', sub: type, injury: !!p.injury, text: tidy(p.text), by, reviewed: false };
+    const said = p.writeText ? String(p.writeText).trim() : tidy(p.text);
+    const inc = { id: uid(), ts: now, resId: r.id, type: p.type === 'fall' ? 'Fall' : 'Concern', sub: type, injury: !!p.injury, text: said, by, reviewed: false };
     h.incidents.push(inc);
-    const a = addAction(h, 'Review ' + type.toLowerCase() + ': ' + resName(r), tidy(p.text), p.type === 'fall' ? 'Manager' : 'Nurse in charge', p.type === 'fall' ? 2 : 1, 'New');
+    const a = addAction(h, 'Review ' + type.toLowerCase() + ': ' + resName(r), said, p.type === 'fall' ? 'Manager' : 'Nurse in charge', p.type === 'fall' ? 2 : 1, 'New');
     inc.actionId = a.id;
   }
   return { fluids: 'Fluids saved', turned: 'Turn saved', fall: 'Fall reported, manager alerted', concern: 'Concern flagged', weight: 'Weight saved', note: 'Note saved' }[p.type] || 'Saved';
@@ -432,7 +467,7 @@ const ROLES = [
   { id: 'cook', name: 'Cook', icon: '<path d="M6 13h12v6a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1zM7 13a4 4 0 1 1 2.5-7.1A4 4 0 0 1 17 9a3.5 3.5 0 0 1 0 4" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/>' }
 ];
 const ROLE_PERSON = { owner: 'Owner', manager: 'Manager', nurse: 'Nurse', carer: 'Carer', cook: 'Cook' };
-const UI = { sub: {}, openInv: false };
+const UI = { sub: {}, openInv: false, pending: 0, voice: null };
 let $view, $sheetWrap, $sheet, $toast;
 
 function toast(msg) {
@@ -441,7 +476,7 @@ function toast(msg) {
   clearTimeout(toast.t); toast.t = setTimeout(() => { $toast.hidden = true; }, 2600);
 }
 function openSheet(html) { $sheet.innerHTML = html; $sheetWrap.hidden = false; document.body.style.overflow = 'hidden'; const f = $sheet.querySelector('[autofocus]'); if (f) setTimeout(() => f.focus(), 50); }
-function closeSheet() { stopListening(true); $sheetWrap.hidden = true; $sheet.innerHTML = ''; document.body.style.overflow = ''; }
+function closeSheet() { stopRecording(true); $sheetWrap.hidden = true; $sheet.innerHTML = ''; document.body.style.overflow = ''; }
 const sheetHead = (title, sub) => `<div class="sheet-h"><div><h2>${esc(title)}</h2>${sub ? `<p class="hint">${sub}</p>` : ''}</div><button type="button" class="x" data-act="closeSheet" aria-label="Close">\u00d7</button></div>`;
 
 function renderTop() {
@@ -457,7 +492,8 @@ function render() {
   let html = '';
   if (S.homeId === 'all') html = viewGroup();
   else html = ({ owner: viewOwner, manager: viewManager, nurse: viewNurse, carer: viewCarer, cook: viewCook })[S.role]();
-  if (!saveOk) html = '<div class="notice">This browser is not letting the demo save (private browsing?). Changes will be lost when you close it.</div>' + html;
+  if (UI.pending) html = `<div class="notice" style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap"><span><b>${UI.pending} voice note${UI.pending > 1 ? 's' : ''} waiting</b> to be written up (recorded with no signal).</span><button type="button" class="btn pri sm" data-act="flushQueue">Write up now</button></div>` + html;
+  if (!saveOk) html ='<div class="notice">This browser is not letting the demo save (private browsing?). Changes will be lost when you close it.</div>' + html;
   $view.innerHTML = html;
 }
 function homeHead(h, title) {
@@ -681,7 +717,8 @@ function aboutSheet() {
   <p>This is a working demo of a care home app with <b>made-up residents, staff and figures</b>. Nothing here is real.</p>
   <p>Use the tabs at the bottom to switch between <b>Owner, Manager, Nurse, Carer and Cook</b>. In the real app each person logs in with a PIN and sees only their own screens.</p>
   <p>Press <b>Speak</b> on any screen and say what happened. It recognises residents' names, drinks in ml, turns, falls, weights, fridge temperatures and food waste. Everything you add is <b>saved on this phone</b>, and feeds the owner's dashboard straight away.</p>
-  <div class="notice">Voice works in Safari on iPhone and Chrome on Android. If you opened this link inside WhatsApp or Facebook, open it in Safari or Chrome instead. On iPhone, Dictation must be on (Settings \u203a General \u203a Keyboard).</div>
+  <p>Voice notes are recorded on the phone, then turned into text and written up by AI, so names and care words come out right. You check each one before it\u2019s saved. With no signal, the recording is kept and written up later.</p>
+  <div class="notice">Works best in Safari on iPhone and Chrome on Android. If you opened this link inside WhatsApp or Facebook, open it in Safari or Chrome instead. The first time you press Speak, allow the microphone.</div>
   <p class="hint">To install it like an app: in Safari tap Share \u203a Add to Home Screen. In Chrome tap \u22ee \u203a Add to Home screen.</p>
   <div class="btns"><button type="button" class="btn pri" data-act="closeSheet">Start the demo</button><button type="button" class="btn" data-act="resetAsk">Reset demo data</button></div>`);
 }
@@ -771,7 +808,8 @@ function concernSheet() {
     <label class="fld"><span>What happened</span><select name="kind"><option value="fall">Fall</option><option value="skin">Skin or pressure area</option><option value="eating">Not eating or drinking</option><option value="unwell">Unwell</option><option value="behaviour">Behaviour</option><option value="safeguarding">Safeguarding</option><option value="other">Other concern</option></select></label>
     <label class="check"><input type="checkbox" name="injury"> Possible injury</label>
     <label class="fld"><span>Details</span><textarea name="text" id="concernText" required placeholder="What you saw and what you did"></textarea></label>
-    <div class="btns"><button type="button" class="btn" data-act="dictate" data-target="concernText">Speak the details</button><button class="btn pri" type="submit">Send report</button></div>
+    <p class="hint">Quicker: close this and press <b>Speak</b>, then say what happened. Falls and concerns are picked up from the recording.</p>
+    <div class="btns"><button class="btn pri" type="submit">Send report</button></div>
   </form>`);
 }
 function addActionSheet() {
@@ -789,110 +827,255 @@ function addEnquirySheet() {
   <button class="btn pri" type="submit">Add</button></form>`);
 }
 
-/* ----- voice ----- */
-const SR = root.SpeechRecognition || root.webkitSpeechRecognition;
-let rec = null, listening = false, cancelled = false, heardFinal = '', heardInterim = '', voiceCtx = null, voiceErr = '';
-function setMic(on) { const b = document.getElementById('micBtn'); if (b) { b.classList.toggle('on', on); b.setAttribute('aria-label', on ? 'Stop listening' : 'Speak'); b.querySelector('span').textContent = on ? 'Stop' : 'Speak'; } }
+/* ----- voice: record on the phone, transcribe + write up on the server ----- */
+const HAS_DOC = typeof document !== 'undefined';
+// Where the voice service lives. Read from voice.json at start-up, so a new address only means updating that one file.
+let VOICE_API = HAS_DOC && /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? 'http://localhost:3402' : '';
+async function loadVoiceApi() {
+  if (VOICE_API) return;
+  try {
+    const j = await (await fetch('voice.json?t=' + Date.now(), { cache: 'no-store' })).json();
+    VOICE_API = String(j.api || '').trim().replace(/\/$/, '');
+    try { localStorage.setItem('carehome-voice-api', VOICE_API); } catch (e) { }
+  } catch (e) { try { VOICE_API = localStorage.getItem('carehome-voice-api') || ''; } catch (x) { } }
+}
+let mediaRec = null, recChunks = [], recStream = null, recStart = 0, recTimer = null, recCancelled = false, voiceCtx = {};
+const canRecord = () => !!(HAS_DOC && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && root.MediaRecorder);
+function setMic(on) { const b = document.getElementById('micBtn'); if (b) { b.classList.toggle('on', on); b.setAttribute('aria-label', on ? 'Stop recording' : 'Speak'); b.querySelector('span').textContent = on ? 'Done' : 'Speak'; } }
 function voiceHints() {
   const h = H(), n = (h.residents[0] || {}).first || 'Margaret', n2 = (h.residents[1] || {}).first || 'Dai';
   return ({
-    carer: [`${n} drank 200 ml of tea`, `${n2} has been repositioned onto his left side`, `${n} had a fall in the bathroom, no injury`, `${n2} ate all his lunch and is in good spirits`],
+    carer: [`${n} drank 200 ml of tea and ate most of her lunch`, `${n2} has been repositioned onto his left side`, `${n} had a fall in the bathroom, no injury`],
     nurse: [`${n} weighs 52.4 kilos`, `${n2} has a red area on her heel`, `${n} refused her evening tablets`],
-    cook: ['Fridge 1 is 4 degrees', 'Freezer minus 19', 'Waste 4 portions of fish pie left on plates'],
-    manager: [`${n} had a fall in the lounge`, `${n2} is agitated this afternoon`, 'Fridge 2 is 7 degrees'],
-    owner: [`${n} drank 2 cups of tea`, 'Waste 3 portions of rice pudding', `${n2} is unwell with a chesty cough`]
+    cook: ['Fridge 1 is 4 degrees and the freezer is minus 19', 'Waste 4 portions of fish pie left on plates'],
+    manager: [`${n} had a fall in the lounge`, `${n2} is agitated this afternoon`],
+    owner: [`${n} drank 2 cups of tea and was chatty after lunch`, `${n2} is unwell with a chesty cough`]
   })[S.role] || [];
 }
-function listeningSheet() {
-  openSheet(`${sheetHead('Listening\u2026', 'Speak normally. Say the resident\u2019s name.')}
-  <div class="listen"><div class="dot"><svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
-  <div class="heard" id="heard"><i>Try: \u201c${esc(voiceHints()[0] || '')}\u201d</i></div>
-  <div class="btns"><button type="button" class="btn pri" data-act="stopMic">Done</button><button type="button" class="btn" data-act="closeSheet">Cancel</button></div></div>`);
+function pickMime() {
+  const c = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
+  for (const m of c) { try { if (root.MediaRecorder.isTypeSupported && root.MediaRecorder.isTypeSupported(m)) return m; } catch (e) { } }
+  return '';
 }
-function startListening(ctx) {
+const MIC_SVG = '<svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+function recordingSheet(starting) {
+  const who = voiceCtx.resId ? resById(H(), voiceCtx.resId) : null;
+  openSheet(`${sheetHead(starting ? 'Starting the microphone…' : 'Recording', who ? 'Note for ' + esc(resName(who)) : 'Say the resident’s name and what happened.')}
+  <div class="listen"><div class="dot"${starting ? ' style="animation:none;opacity:.5"' : ''}>${MIC_SVG}</div>
+  <div class="heard"><b id="recTime" class="num">0:00</b></div>
+  <p class="hint">For example: “${esc(voiceHints()[0] || '')}”. You can mention several residents in one note.</p>
+  <div class="btns"><button type="button" class="btn pri" data-act="stopRec" ${starting ? 'disabled' : ''}>Done</button><button type="button" class="btn" data-act="closeSheet">Cancel</button></div></div>`);
+}
+function workingSheet(title, sub) {
+  openSheet(`${sheetHead(title, sub)}<div class="listen"><div class="dot" style="background:var(--acc)">${MIC_SVG}</div><p class="hint">Turning the recording into text, then writing up the note.</p></div>`);
+}
+function stopTracks() { if (recStream) { recStream.getTracks().forEach(t => t.stop()); recStream = null; } }
+function stopRecording(cancel) {
+  if (!mediaRec) { stopTracks(); return; }
+  recCancelled = !!cancel;
+  try { if (mediaRec.state !== 'inactive') mediaRec.stop(); } catch (e) { }
+  if (cancel) { setMic(false); clearInterval(recTimer); }
+}
+async function startRecording(ctx) {
   voiceCtx = ctx || {};
-  if (!SR) { voiceSheet('', true); return; }
-  if (listening) { stopListening(false); return; }
-  cancelled = false; heardFinal = voiceCtx.prefix || ''; heardInterim = ''; voiceErr = '';
+  if (mediaRec) { stopRecording(false); return; }
+  if (!canRecord()) { typeSheet('Recording isn’t available in this browser. Open the link in Safari (iPhone) or Chrome (Android) to speak, or type below.'); return; }
+  recordingSheet(true);
   try {
-    rec = new SR(); rec.lang = 'en-GB'; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
-    rec.onresult = e => {
-      heardInterim = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        if (r.isFinal) heardFinal = (heardFinal + ' ' + r[0].transcript).trim(); else heardInterim += r[0].transcript;
-      }
-      const el = document.getElementById('heard');
-      if (el) el.innerHTML = esc(heardFinal) + (heardInterim ? ' <i>' + esc(heardInterim) + '</i>' : '');
-    };
-    rec.onerror = e => { voiceErr = e.error || 'error'; };
-    rec.onend = () => {
-      listening = false; setMic(false);
-      if (cancelled) return;
-      const text = (heardFinal + ' ' + heardInterim).trim();
-      if (voiceErr === 'not-allowed' || voiceErr === 'service-not-allowed') { voiceSheet(text, true, 'The microphone is blocked for this page. Allow it in your browser settings (in Safari: aA \u203a Website Settings \u203a Microphone), or type below.'); return; }
-      if (!text) { voiceSheet('', true, voiceErr === 'no-speech' || !voiceErr ? 'Didn\u2019t catch anything. Try again, or type below.' : 'Voice stopped (' + voiceErr + '). Try again, or type below.'); return; }
-      voiceSheet(text, false);
-    };
-    listening = true; setMic(true); listeningSheet();
-    rec.start();
-  } catch (e) { listening = false; setMic(false); voiceSheet('', true, 'Voice could not start on this browser. Type below instead.'); }
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+  } catch (e) {
+    typeSheet(e && (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'The microphone is blocked for this page. Allow it (iPhone: tap aA in the address bar › Website Settings › Microphone › Allow), then try again. Or type below.' : 'The microphone could not start (' + (e && e.name || 'error') + '). Type below instead.');
+    return;
+  }
+  if ($sheetWrap.hidden) { stopTracks(); return; } // cancelled while the permission prompt was up
+  recChunks = []; recCancelled = false;
+  const mime = pickMime();
+  try { mediaRec = mime ? new MediaRecorder(recStream, { mimeType: mime, audioBitsPerSecond: 48000 }) : new MediaRecorder(recStream); } catch (e) { mediaRec = new MediaRecorder(recStream); }
+  const ctxNow = voiceCtx;
+  mediaRec.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+  mediaRec.onstop = () => {
+    const type = (mediaRec && mediaRec.mimeType) || mime || 'audio/webm';
+    const blob = new Blob(recChunks, { type }), secs = (Date.now() - recStart) / 1000;
+    mediaRec = null; stopTracks(); setMic(false); clearInterval(recTimer);
+    if (recCancelled) return;
+    if (secs < 0.8 || blob.size < 800) { typeSheet('That was too short to hear anything. Try again, or type below.', ctxNow); return; }
+    processRecording({ blob, type, ctx: ctxNow });
+  };
+  mediaRec.start(1000); recStart = Date.now(); setMic(true); recordingSheet(false);
+  recTimer = setInterval(() => {
+    const el = document.getElementById('recTime');
+    const s = Math.floor((Date.now() - recStart) / 1000);
+    if (el) el.textContent = Math.floor(s / 60) + ':' + pad(s % 60);
+    if (s >= 180) stopRecording(false);
+  }, 250);
 }
-function stopListening(cancel) { if (!rec) return; cancelled = !!cancel; try { cancel ? rec.abort() : rec.stop(); } catch (e) { } if (cancel) { listening = false; setMic(false); } }
+function voiceContext(h) {
+  return {
+    home: h.name + ', ' + h.town, role: ROLE_PERSON[S.role] || 'Staff', units: h.units.map(u => u.name),
+    residents: h.residents.map(r => ({ name: resName(r), room: r.room, unit: unitName(h, r.unit) })),
+    staff: (h.carers || []).concat(['Sian', 'Tomasz', 'Priya', 'Rhian']),
+    meds: [...new Set(h.residents.flatMap(r => r.meds.map(m => m.name)))]
+  };
+}
+const blobToBase64 = blob => new Promise((ok, bad) => { const fr = new FileReader(); fr.onload = () => ok(String(fr.result).split(',')[1] || ''); fr.onerror = () => bad(fr.error); fr.readAsDataURL(blob); });
+const base64ToBlob = (b64, type) => { const bin = atob(b64), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new Blob([u], { type }); };
+async function callVoice(payload) {
+  if (!VOICE_API) { const e = new Error('No voice server is set up'); e.offline = true; throw e; }
+  const ctrl = new AbortController(), t = setTimeout(() => ctrl.abort(), 75000);
+  try {
+    const r = await fetch(VOICE_API + '/api/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: ctrl.signal });
+    const j = await r.json().catch(() => ({ error: 'The voice server sent back something unexpected.' }));
+    if (!r.ok) { const e = new Error(j.error || ('Voice server error ' + r.status)); e.status = r.status; throw e; }
+    return j;
+  } catch (e) { if (e.name === 'AbortError' || e instanceof TypeError) e.offline = true; throw e; }
+  finally { clearTimeout(t); }
+}
+function wakeVoice() { if (VOICE_API) fetch(VOICE_API + '/health', { mode: 'cors' }).catch(() => { }); }
 
-function voiceSheet(text, typed, msg) {
-  const h = H(), p = parseSpeech(text, h.residents);
-  if (voiceCtx && voiceCtx.resId && !p.resId && !['temp', 'waste'].includes(p.type)) p.resId = voiceCtx.resId;
-  const noVoice = !SR;
-  openSheet(`${sheetHead(typed ? (text ? 'Check and save' : 'Type it in') : 'Check and save', typed ? '' : 'This is what was heard. Fix anything, then save.')}
-  ${noVoice ? '<div class="notice">Voice isn\u2019t available in this browser. Open the link in Safari (iPhone) or Chrome (Android) to speak. You can type for now.</div>' : ''}
-  ${msg ? `<div class="notice">${esc(msg)}</div>` : ''}
-  <form class="form" data-form="voice" id="voiceForm">
-    <label class="fld"><span>What was said</span><textarea id="vText" name="text" ${typed ? 'autofocus' : ''} placeholder="e.g. ${esc(voiceHints()[0] || '')}">${esc(text)}</textarea></label>
-    <div class="frow"><label class="fld"><span>Type</span><select name="type" id="vType">${Object.entries(TYPE_LABEL).map(([k, l]) => `<option value="${k}" ${p.type === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <label class="fld" id="vResWrap"><span>Resident</span><select name="resId" id="vRes">${residentOptions(h, p.resId)}</select></label></div>
-    <div id="vExtra"></div>
-    <div><div class="eyebrow" style="margin-bottom:6px">Written up as</div><div class="writeup" id="vOut"></div><p class="hint" style="margin-top:6px">Demo write-up done on the phone. The live app uses AI to write the note up in full.</p></div>
-    <div class="btns">${SR ? '<button type="button" class="btn" data-act="speakMore">Speak again</button>' : ''}<button type="submit" class="btn pri">Save</button><button type="button" class="btn" data-act="closeSheet">Cancel</button></div>
-  </form>`);
-  updateVoicePreview(p, true);
+/* offline queue: recordings wait in IndexedDB until there is signal */
+const Q = {
+  db: null,
+  open() { return this.db ? Promise.resolve(this.db) : new Promise((ok, bad) => { const r = indexedDB.open('care-demo-voice', 1); r.onupgradeneeded = () => r.result.createObjectStore('pending', { keyPath: 'id' }); r.onsuccess = () => { this.db = r.result; ok(this.db); }; r.onerror = () => bad(r.error); }); },
+  async tx(mode, fn) { const db = await this.open(); return new Promise((ok, bad) => { const t = db.transaction('pending', mode), st = t.objectStore('pending'); const out = fn(st); t.oncomplete = () => ok(out && out.result !== undefined ? out.result : out); t.onerror = () => bad(t.error); }); },
+  put(rec) { return this.tx('readwrite', st => st.put(rec)); },
+  del(id) { return this.tx('readwrite', st => st.delete(id)); },
+  async all() { const db = await this.open(); return new Promise((ok, bad) => { const r = db.transaction('pending').objectStore('pending').getAll(); r.onsuccess = () => ok(r.result || []); r.onerror = () => bad(r.error); }); }
+};
+async function refreshPending() { try { UI.pending = (await Q.all()).length; } catch (e) { UI.pending = 0; } }
+async function queueRecording(blob, type, ctx) {
+  const h = H(); const b64 = await blobToBase64(blob);
+  await Q.put({ id: uid() + Date.now(), ts: Date.now(), b64, type, ctx: ctx || {}, homeId: h.id, role: S.role });
+  await refreshPending();
 }
-function readVoiceForm(fromTextChange) {
-  const h = H(), text = document.getElementById('vText').value;
-  const p = parseSpeech(text, h.residents);
-  const typeSel = document.getElementById('vType'), resSel = document.getElementById('vRes');
-  if (fromTextChange) {
-    if (p.type !== 'note' || !typeSel.dataset.touched) typeSel.value = p.type;
-    if (p.resId && !resSel.dataset.touched) resSel.value = p.resId;
-  }
-  p.type = typeSel.value; p.resId = resSel.value;
-  const ex = id => { const el = document.getElementById(id); return el ? el.value : ''; };
-  if (document.getElementById('xMl') && !fromTextChange) p.ml = Number(ex('xMl')) || p.ml;
-  if (document.getElementById('xKg') && !fromTextChange) p.kg = Number(ex('xKg')) || p.kg;
-  if (document.getElementById('xTemp') && !fromTextChange && ex('xTemp') !== '') p.temp = Number(ex('xTemp'));
-  if (document.getElementById('xApp') && !fromTextChange) p.appliance = ex('xApp');
-  if (document.getElementById('xQty') && !fromTextChange) { p.qty = Number(ex('xQty')) || p.qty; p.item = ex('xItem') || p.item; p.unit = ex('xUnit') || p.unit; }
-  if (document.getElementById('xInj') && !fromTextChange) p.injury = document.getElementById('xInj').checked;
-  if (document.getElementById('xCon') && !fromTextChange) p.concern = ex('xCon');
-  return p;
+async function flushQueue() {
+  const all = (await Q.all()).sort((a, b) => a.ts - b.ts);
+  if (!all.length) { UI.pending = 0; render(); return; }
+  const rec = all[0];
+  if (S.homes[rec.homeId] && S.homeId !== rec.homeId) { S.homeId = rec.homeId; S.lastHome = rec.homeId; }
+  processRecording({ blob: base64ToBlob(rec.b64, rec.type), type: rec.type, ctx: rec.ctx, queuedId: rec.id, b64: rec.b64 });
 }
-function updateVoicePreview(p, rebuildExtra) {
+
+async function processRecording(job) {
   const h = H();
-  const extra = document.getElementById('vExtra');
-  const needsRes = !['temp', 'waste'].includes(p.type);
-  document.getElementById('vResWrap').hidden = !needsRes;
-  if (rebuildExtra) {
-    let x = '';
-    if (p.type === 'fluids') x = `<label class="fld"><span>Amount (ml)</span><input id="xMl" inputmode="numeric" value="${esc(p.ml || '')}"></label>`;
-    if (p.type === 'weight') x = `<label class="fld"><span>Weight (kg)</span><input id="xKg" inputmode="decimal" value="${esc(p.kg || '')}"></label>`;
-    if (p.type === 'temp') x = `<div class="frow"><label class="fld"><span>Where</span><select id="xApp">${['Kitchen fridge 1', 'Kitchen fridge 2', 'Freezer'].map(o => `<option ${o === p.appliance ? 'selected' : ''}>${o}</option>`).join('')}</select></label><label class="fld"><span>\u00b0C</span><input id="xTemp" inputmode="decimal" value="${esc(p.temp == null ? '' : p.temp)}"></label></div>`;
-    if (p.type === 'waste') x = `<div class="frow"><label class="fld"><span>Item</span><input id="xItem" value="${esc(p.item || '')}"></label><label class="fld"><span>Amount</span><input id="xQty" inputmode="decimal" value="${esc(p.qty || 1)}"></label></div><input type="hidden" id="xUnit" value="${esc(p.unit || 'portions')}">`;
-    if (p.type === 'fall') x = `<label class="check"><input type="checkbox" id="xInj" ${p.injury ? 'checked' : ''}> Possible injury</label>`;
-    if (p.type === 'concern') x = `<label class="fld"><span>Kind of concern</span><select id="xCon">${Object.entries(CONCERN_LABEL).map(([k, l]) => `<option value="${k}" ${k === (p.concern || 'other') ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
-    extra.innerHTML = x;
+  workingSheet('Writing it up…', 'Usually a few seconds.');
+  const keep = async (why) => {
+    if (!job.queuedId) await queueRecording(job.blob, job.type, job.ctx);
+    openSheet(`${sheetHead('Recording kept')}<p>${esc(why)}</p><p>It’s saved on this phone and will be written up when you tap <b>Write up now</b> at the top of the screen, once there’s signal.</p><div class="btns"><button type="button" class="btn pri" data-act="closeSheet">OK</button></div>`);
+    render();
+  };
+  if (HAS_DOC && navigator.onLine === false) { await keep('There’s no signal right now.'); return; }
+  try {
+    const audio = job.b64 || await blobToBase64(job.blob);
+    const j = await callVoice({ audio, mime: job.type, context: voiceContext(h) });
+    if (job.queuedId) { await Q.del(job.queuedId); await refreshPending(); }
+    showResults(j, job.ctx);
+  } catch (e) {
+    if (e.offline || (e.status >= 500 && e.status !== 503)) await keep(e.offline ? 'The voice service couldn’t be reached.' : e.message);
+    else typeSheet(e.message, job.ctx);
   }
-  const r = p.resId ? resById(h, p.resId) : null;
-  document.getElementById('vOut').textContent = (needsRes && !r) ? 'Choose the resident above (or say their name).' : writeUp(p, r);
+}
+async function writeUpText(text, ctx) {
+  const h = H();
+  if (!text.trim()) { toast('Type something first'); return; }
+  if (VOICE_API && navigator.onLine !== false) {
+    workingSheet('Writing it up…', '');
+    try { const j = await callVoice({ text, context: voiceContext(h) }); showResults(j, ctx); return; }
+    catch (e) { /* fall through to on-phone matching */ }
+  }
+  showResults({ transcript: text, entries: null, engine: 'local' }, ctx);
+}
+function typeSheet(msg, ctx) {
+  voiceCtx = ctx || voiceCtx || {};
+  const who = voiceCtx.resId ? resById(H(), voiceCtx.resId) : null;
+  openSheet(`${sheetHead('Type it in', who ? 'Note for ' + esc(resName(who)) : '')}
+  ${msg ? `<div class="notice">${esc(msg)}</div>` : ''}
+  <label class="fld"><span>What happened</span><textarea id="typedText" autofocus placeholder="e.g. ${esc(voiceHints()[0] || '')}"></textarea></label>
+  <div class="btns"><button type="button" class="btn pri" data-act="writeTyped">Write it up</button>${canRecord() ? '<button type="button" class="btn" data-act="recordAgain">Record instead</button>' : ''}<button type="button" class="btn" data-act="closeSheet">Cancel</button></div>`);
+}
+
+/* results: one or more entries to check */
+const NEEDS_RES = t => !['temp', 'waste'].includes(t);
+function matchResident(h, name) {
+  if (!name) return '';
+  const n = String(name).toLowerCase().trim();
+  const exact = h.residents.find(r => resName(r).toLowerCase() === n);
+  if (exact) return exact.id;
+  const first = h.residents.filter(r => r.first.toLowerCase() === n.split(' ')[0]);
+  return first.length === 1 ? first[0].id : '';
+}
+function showResults(j, ctx) {
+  const h = H(); ctx = ctx || {};
+  const text = (j.transcript || '').trim();
+  let entries;
+  if (Array.isArray(j.entries)) {
+    entries = j.entries.map(e => ({ type: e.type || 'note', resId: matchResident(h, e.resident), ml: e.ml, kg: e.kg, temp: e.temp, appliance: e.appliance || 'Kitchen fridge 1', qty: e.qty, unit: e.unit || 'portions', item: e.item || '', reason: e.reason || 'Other', injury: !!e.injury, concern: e.concern || 'other', text, writeText: e.write_up || '' }));
+  } else {
+    entries = text ? splitLocal(text, h.residents).map(p => Object.assign(p, { text })) : [];
+  }
+  if (!entries.length && text) entries = [{ type: 'note', resId: '', text, writeText: '' }];
+  entries.forEach(e => { if (ctx.resId && !e.resId && NEEDS_RES(e.type)) e.resId = ctx.resId; });
+  UI.voice = { transcript: text, raw: j.raw || '', entries, unclear: j.unclear || '', engine: j.engine || 'local', ctx };
+  renderResults();
+}
+function entryCard(e, i, h) {
+  const opt = (v, l, cur) => `<option value="${esc(v)}" ${String(cur) === String(v) ? 'selected' : ''}>${esc(l)}</option>`;
+  const f = (field, label, val, mode) => `<label class="fld"><span>${label}</span><input data-vi="${i}" data-f="${field}" inputmode="${mode || 'decimal'}" value="${esc(val == null ? '' : val)}"></label>`;
+  let extra = '';
+  if (e.type === 'fluids') extra = f('ml', 'Amount (ml)', e.ml, 'numeric');
+  if (e.type === 'weight') extra = f('kg', 'Weight (kg)', e.kg);
+  if (e.type === 'temp') extra = `<div class="frow"><label class="fld"><span>Where</span><select data-vi="${i}" data-f="appliance">${['Kitchen fridge 1', 'Kitchen fridge 2', 'Freezer'].map(o => opt(o, o, e.appliance)).join('')}</select></label>${f('temp', '°C', e.temp)}</div>`;
+  if (e.type === 'waste') extra = `<div class="frow"><label class="fld"><span>Item</span><input data-vi="${i}" data-f="item" value="${esc(e.item || '')}"></label>${f('qty', 'Amount (' + esc(e.unit || 'portions') + ')', e.qty || 1)}</div>`;
+  if (e.type === 'fall') extra = `<label class="check"><input type="checkbox" data-vi="${i}" data-f="injury" ${e.injury ? 'checked' : ''}> Possible injury</label>`;
+  if (e.type === 'concern') extra = `<label class="fld"><span>Kind of concern</span><select data-vi="${i}" data-f="concern">${Object.entries(CONCERN_LABEL).map(([k, l]) => opt(k, l, e.concern || 'other')).join('')}</select></label>`;
+  const r = e.resId ? resById(h, e.resId) : null;
+  const preview = NEEDS_RES(e.type) ? '' : `<div class="writeup">${esc(writeUp(e, null))}</div>`;
+  return `<div class="card" style="gap:10px;padding:12px">
+    <div class="card-h"><b>${UI.voice.entries.length > 1 ? (i + 1) + ' · ' : ''}${esc(TYPE_LABEL[e.type] || 'Entry')}${r ? ' · ' + esc(resName(r)) : ''}</b>${UI.voice.entries.length > 1 ? `<button type="button" class="linkbtn" data-act="vRemove" data-i="${i}">Remove</button>` : ''}</div>
+    <div class="frow"><label class="fld"><span>Type</span><select data-vi="${i}" data-f="type">${Object.entries(TYPE_LABEL).map(([k, l]) => opt(k, l, e.type)).join('')}</select></label>
+    ${NEEDS_RES(e.type) ? `<label class="fld"><span>Resident</span><select data-vi="${i}" data-f="resId">${residentOptions(h, e.resId)}</select></label>` : '<span></span>'}</div>
+    ${extra}
+    ${NEEDS_RES(e.type) ? `<label class="fld"><span>Written up as</span><textarea data-vi="${i}" data-f="writeText" style="min-height:80px">${esc(e.writeText || tidy(e.text))}</textarea></label>` : preview}
+  </div>`;
+}
+function renderResults() {
+  const h = H(), v = UI.voice;
+  const by = v.engine === 'scribe+claude' ? 'Transcribed and written up by AI from your recording.' : (v.engine === 'scribe' ? 'Transcribed from your recording.' : 'Matched on this phone.');
+  openSheet(`${sheetHead('Check and save', by + ' Fix anything, then save.')}
+  ${v.unclear ? `<div class="notice">${esc(v.unclear)}</div>` : ''}
+  <form class="form" data-form="vresults">
+    <details ${v.entries.length ? '' : 'open'}><summary>What was heard</summary>
+      <label class="fld"><span class="sr">What was heard</span><textarea id="vText">${esc(v.transcript)}</textarea></label>
+      <button type="button" class="btn sm" data-act="rewrite">Write up again from this text</button>
+    </details>
+    ${v.entries.map((e, i) => entryCard(e, i, h)).join('') || '<p class="empty">Nothing to file. Edit the text above and write it up again, or record again.</p>'}
+    <div class="btns"><button type="submit" class="btn pri" ${v.entries.length ? '' : 'disabled'}>Save${v.entries.length > 1 ? ' all ' + v.entries.length : ''}</button><button type="button" class="btn" data-act="recordAgain">Record again</button><button type="button" class="btn" data-act="closeSheet">Cancel</button></div>
+  </form>`);
+}
+function onVoiceField(e) {
+  const el = e.target; if (!el.dataset || el.dataset.vi == null || !UI.voice) return;
+  const ent = UI.voice.entries[Number(el.dataset.vi)], f = el.dataset.f;
+  if (!ent) return;
+  ent[f] = el.type === 'checkbox' ? el.checked : el.value;
+  if (f === 'type' || (f === 'resId' && e.type === 'change')) {
+    if (f === 'type' && NEEDS_RES(ent.type) && !ent.resId && UI.voice.ctx.resId) ent.resId = UI.voice.ctx.resId;
+    const open = $sheet.querySelector('details') && $sheet.querySelector('details').open;
+    renderResults(); if (open) $sheet.querySelector('details').open = true;
+  }
+}
+function saveResults() {
+  const h = H(), v = UI.voice; if (!v) return;
+  for (const e of v.entries) {
+    if (NEEDS_RES(e.type) && !e.resId) { toast('Choose the resident for each entry'); return; }
+    if (e.type === 'temp' && (e.temp === '' || e.temp == null || isNaN(Number(e.temp)))) { toast('Add the temperature'); return; }
+    if (e.type === 'fluids' && !(Number(e.ml) > 0)) { toast('Add how much was drunk (ml)'); return; }
+  }
+  const msgs = v.entries.map(e => {
+    const p = Object.assign({}, e, { ml: Number(e.ml) || 0, kg: Number(e.kg) || 0, temp: e.temp === '' || e.temp == null ? null : Number(e.temp), qty: Number(e.qty) || 1, text: v.transcript });
+    return fileEntry(h, p, ROLE_PERSON[S.role] || 'Staff');
+  }).filter(Boolean);
+  UI.voice = null; save(); closeSheet(); render();
+  toast(msgs.length > 1 ? msgs.length + ' entries saved' : (msgs[0] || 'Saved'));
+  if (UI.pending) setTimeout(() => toast(UI.pending + ' more recording' + (UI.pending > 1 ? 's' : '') + ' waiting'), 2800);
 }
 
 /* ----- events ----- */
@@ -906,12 +1089,15 @@ function onClick(e) {
     case 'role': setRole(el.dataset.role); break;
     case 'about': aboutSheet(); break;
     case 'closeSheet': closeSheet(); break;
-    case 'mic': if (listening) stopListening(false); else startListening({}); break;
-    case 'stopMic': stopListening(false); break;
-    case 'micFor': closeSheet(); startListening({ resId: el.dataset.id }); break;
-    case 'typeFor': voiceCtx = { resId: el.dataset.id }; voiceSheet('', true); break;
-    case 'speakMore': { const t = document.getElementById('vText').value; const ctx = Object.assign({}, voiceCtx, { prefix: t }); const rs = document.getElementById('vRes').value; if (rs) ctx.resId = rs; closeSheet(); startListening(ctx); break; }
-    case 'dictate': dictateInto(el.dataset.target, el); break;
+    case 'mic': if (mediaRec) stopRecording(false); else startRecording({}); break;
+    case 'stopRec': stopRecording(false); break;
+    case 'micFor': closeSheet(); startRecording({ resId: el.dataset.id }); break;
+    case 'typeFor': typeSheet('', { resId: el.dataset.id }); break;
+    case 'recordAgain': { const ctx = (UI.voice && UI.voice.ctx) || voiceCtx || {}; UI.voice = null; closeSheet(); startRecording(ctx); break; }
+    case 'writeTyped': writeUpText(document.getElementById('typedText').value, voiceCtx); break;
+    case 'rewrite': writeUpText(document.getElementById('vText').value, UI.voice ? UI.voice.ctx : {}); break;
+    case 'vRemove': UI.voice.entries.splice(Number(el.dataset.i), 1); renderResults(); break;
+    case 'flushQueue': flushQueue(); break;
     case 'sub': UI.sub[el.dataset.r] = el.dataset.s; render(); break;
     case 'unit': S.unit[H().id] = el.dataset.u; save(); render(); break;
     case 'round': UI.round = el.dataset.rd; render(); break;
@@ -950,14 +1136,7 @@ function onSubmit(e) {
   e.preventDefault();
   const fd = new FormData(form), g = k => (fd.get(k) || '').toString().trim(), h = H();
   switch (form.dataset.form) {
-    case 'voice': {
-      const p = readVoiceForm(false);
-      if (!p.text.trim() && !['temp', 'waste'].includes(p.type)) { toast('Say or type something first'); return; }
-      if (!['temp', 'waste'].includes(p.type) && !p.resId) { toast('Choose the resident'); document.getElementById('vRes').focus(); return; }
-      if (p.type === 'temp' && (p.temp == null || isNaN(p.temp))) { toast('Add the temperature'); return; }
-      const msg = fileEntry(h, p, ROLE_PERSON[S.role] || 'Staff');
-      save(); closeSheet(); render(); toast(msg || 'Saved'); break;
-    }
+    case 'vresults': saveResults(); break;
     case 'weight': { const kg = parseFloat(g('kg')); if (!kg) return; const r = resById(h, form.dataset.id); const p = { type: 'weight', kg, resId: r.id, text: r.first + ' weighed ' + kg + ' kg.' }; fileEntry(h, p, 'Nurse'); save(); render(); toast(weightLoss(r) >= 5 ? 'Saved \u00b7 5% loss alert raised' : 'Weight saved'); break; }
     case 'review': { const r = resById(h, form.dataset.id); r.planCurrent = true; if (fd.get('family')) r.familyInvolved = true; r.notes.push({ id: uid(), ts: Date.now(), by: 'Nurse', text: 'Care plan reviewed and signed off' + (fd.get('family') ? ', with family taking part.' : '.'), heard: '', type: 'note' }); save(); render(); toast('Review signed off'); break; }
     case 'waste': h.waste.push({ id: uid(), ts: Date.now(), item: g('item'), qty: parseFloat(g('qty')) || 1, unit: g('unit'), reason: g('reason') }); save(); render(); toast('Waste logged'); break;
@@ -989,33 +1168,17 @@ function onSubmit(e) {
     case 'enquiry': h.enquiries.push({ id: uid(), ts: Date.now(), from: g('from'), name: g('name'), need: g('need'), status: g('status') }); save(); closeSheet(); render(); toast('Enquiry added'); break;
   }
 }
-function dictateInto(targetId, btn) {
-  const ta = document.getElementById(targetId);
-  if (!SR) { toast('Voice needs Safari or Chrome'); ta.focus(); return; }
-  try {
-    const r = new SR(); r.lang = 'en-GB'; r.interimResults = false; r.continuous = false;
-    btn.textContent = 'Listening\u2026'; btn.disabled = true;
-    r.onresult = e => { const t = Array.from(e.results).map(x => x[0].transcript).join(' '); ta.value = (ta.value + ' ' + t).trim(); };
-    r.onerror = e => { if (e.error === 'not-allowed') toast('Microphone blocked for this page'); };
-    r.onend = () => { btn.textContent = 'Speak the details'; btn.disabled = false; };
-    r.start();
-  } catch (e) { toast('Voice could not start'); }
-}
-function onInput(e) {
-  if (!document.getElementById('voiceForm')) return;
-  const id = e.target.id;
-  if (id === 'vText') { const p = readVoiceForm(true); updateVoicePreview(p, true); }
-  else if (id === 'vType' || id === 'vRes') { e.target.dataset.touched = '1'; const p = readVoiceForm(false); updateVoicePreview(p, id === 'vType'); }
-  else if (/^x/.test(id)) { const p = readVoiceForm(false); updateVoicePreview(p, false); }
-}
-
 function init() {
   $view = document.getElementById('view'); $sheetWrap = document.getElementById('sheetWrap'); $sheet = document.getElementById('sheet'); $toast = document.getElementById('toast');
   S = load();
   if (!S) { S = seedAll(); save(); }
   document.addEventListener('click', onClick);
-  document.addEventListener('change', e => { if (e.target.matches('[data-act="orderTick"]')) return; onInput(e); });
-  document.addEventListener('input', onInput);
+  document.addEventListener('change', e => { if (e.target.matches('[data-act="orderTick"]')) return; onVoiceField(e); });
+  document.addEventListener('input', e => { if (e.target.tagName !== 'SELECT') onVoiceField(e); });
+  window.addEventListener('online', () => { if (UI.pending) toast('Signal back · tap Write up now'); });
+  loadVoiceApi().then(wakeVoice);
+  if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) root.__careTest = { processRecording, showResults, state: () => S, ui: UI };
+  refreshPending().then(() => { if (UI.pending) render(); });
   document.addEventListener('submit', onSubmit);
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && !$sheetWrap.hidden) closeSheet();
@@ -1028,7 +1191,7 @@ function init() {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { parseSpeech, normalise, wordsToDigits, writeUp, tidy, seedAll, stats, findResident };
+  module.exports = { splitLocal, parseSpeech, normalise, wordsToDigits, writeUp, tidy, seedAll, stats, findResident };
 } else {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 }
