@@ -201,6 +201,7 @@ function seedHome(id) {
   [['Milk', 'litres', 18, 30], ['Bread', 'loaves', 6, 12], ['Thickener', 'tins', 3, 6], ['Fortified shakes', 'bottles', 12, 24], ['Eggs', 'trays', 2, 4], ['Potatoes', 'kg', 25, 20], ['Tea bags', 'boxes', 8, 6], ['Butter', 'kg', 3, 4]]
     .forEach(([n, u, q, par]) => h.stock.push({ id: uid(), name: n, unit: u, qty: q, par, order: q < par }));
   h.orderSent = null;
+  setupEscalation(h, id);
   return h;
 }
 
@@ -212,7 +213,7 @@ function seedAll() {
 
 /* ---------------- storage ---------------- */
 let S = null;
-function load() { try { const raw = localStorage.getItem(STORE_KEY); if (!raw) return null; const s = JSON.parse(raw); return s && s.v === 1 ? s : null; } catch (e) { return null; } }
+function load() { try { const raw = localStorage.getItem(STORE_KEY); if (!raw) return null; const s = JSON.parse(raw); if (!s || s.v !== 1) return null; Object.keys(s.homes || {}).forEach(id => { if (!s.homes[id].escV) setupEscalation(s.homes[id], id); }); return s; } catch (e) { return null; } }
 let saveOk = true;
 function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); saveOk = true; } catch (e) { saveOk = false; } }
 
@@ -455,7 +456,124 @@ function fileEntry(h, p, by) {
     const a = addAction(h, 'Review ' + type.toLowerCase() + ': ' + resName(r), said, p.type === 'fall' ? 'Manager' : 'Nurse in charge', p.type === 'fall' ? 2 : 1, 'New');
     inc.actionId = a.id;
   }
+  if ((p.type === 'fall' || p.type === 'concern') && (p.injury || p.concern === 'safeguarding')) return 'Serious: manager and owner both alerted';
+  if (p.type === 'fall' && h.managerOff) return 'Fall reported, deputy alerted (manager off)';
   return { fluids: 'Fluids saved', turned: 'Turn saved', fall: 'Fall reported, manager alerted', concern: 'Concern flagged', weight: 'Weight saved', note: 'Note saved' }[p.type] || 'Saved';
+}
+
+/* ---------------- escalation: nothing gets stuck with one person ---------------- */
+// Who an item goes to next if it isn't done in time. "Deputy" stands in for the manager when the manager is off.
+const CHAIN = { 'Manager': ['Manager', 'Deputy', 'Owner'], 'Nurse in charge': ['Nurse in charge', 'Manager', 'Owner'], 'Admin': ['Admin', 'Manager', 'Owner'], 'Maintenance': ['Maintenance', 'Manager', 'Owner'], 'Cook': ['Cook', 'Manager', 'Owner'], 'Deputy': ['Deputy', 'Owner'], 'Owner': ['Owner'] };
+const SCORE_ROLES = ['Manager', 'Deputy', 'Nurse in charge', 'Admin', 'Maintenance', 'Cook'];
+const PEOPLE = { stannes: { manager: 'Claire', deputy: 'Sian' }, caerleon: { manager: 'Gareth', deputy: 'Bethan' }, parkside: { manager: 'Lowri', deputy: 'Mo' }, overseal: { manager: 'Dawn', deputy: 'Priya' } };
+const isSerious = i => !!i.injury || /safeguard/i.test(i.sub || '');
+function personName(h, role) {
+  const p = h.people || {};
+  if (role === 'Manager') return 'Manager (' + (p.manager || 'manager') + ')';
+  if (role === 'Deputy') return 'Deputy (' + (p.deputy || 'deputy') + ')';
+  if (role === 'Owner') return 'Owner';
+  return role;
+}
+const personLow = (h, role) => personName(h, role).replace(/^[A-Z][a-z ]+/, m => m.toLowerCase());
+function chainFor(h, role) {
+  let c = (CHAIN[role] || [role, 'Manager', 'Owner']).slice();
+  if (h.managerOff) c = c.map(r => r === 'Manager' ? 'Deputy' : r);
+  return c.filter((r, i) => c.indexOf(r) === i);
+}
+function incAssignee(i) { return i.assignee || (i.type === 'Fall' ? 'Manager' : 'Nurse in charge'); }
+// Pure: where an open item sits right now, and when it moves next.
+function escState(h, item, kind, now) {
+  now = now || Date.now();
+  const assigned = kind === 'inc' ? incAssignee(item) : item.owner;
+  const chain = chainFor(h, assigned);
+  let start, t1, t2, limit;
+  if (kind === 'inc') {
+    const d = isSerious(item) ? HOUR : 4 * HOUR;
+    start = item.ts; t1 = item.ts + d; t2 = item.ts + 2 * d; limit = isSerious(item) ? '1 hour' : '4 hours';
+  } else {
+    start = item.created || now; t1 = new Date(item.due + 'T00:00:00').getTime() + DAY; t2 = t1 + 2 * DAY; limit = 'its due date';
+  }
+  const stepAt = [t1, t2];
+  let idx = now >= t2 ? 2 : (now >= t1 ? 1 : 0);
+  idx = Math.min(idx, chain.length - 1);
+  const holder = item.takenBy || chain[idx];
+  return {
+    assigned, chain, idx, holder, limit, taken: !!item.takenBy,
+    escalated: !item.takenBy && idx > 0,
+    rerouted: !!h.managerOff && chain[0] !== assigned,
+    since: idx > 0 ? stepAt[idx - 1] : start,
+    nextAt: !item.takenBy && idx < chain.length - 1 ? stepAt[idx] : null,
+    nextRole: !item.takenBy && idx < chain.length - 1 ? chain[idx + 1] : null,
+    serious: kind === 'inc' && isSerious(item)
+  };
+}
+function itemLabel(h, item, kind) {
+  if (kind === 'inc') { const r = resById(h, item.resId); return (item.sub || item.type) + ': ' + resName(r); }
+  return item.title;
+}
+// Every open item, with its escalation state. Actions created for an incident are covered by the incident.
+function openItems(h, now) {
+  const out = [];
+  h.incidents.filter(i => !i.reviewed).forEach(i => out.push({ kind: 'inc', item: i, st: escState(h, i, 'inc', now) }));
+  const linked = new Set(h.incidents.map(i => i.actionId).filter(Boolean));
+  h.actions.filter(a => !a.done && !linked.has(a.id)).forEach(a => out.push({ kind: 'act', item: a, st: escState(h, a, 'act', now) }));
+  return out;
+}
+function logEsc(h, entry) { h.escLog = h.escLog || []; h.escLog.push(Object.assign({ id: uid() }, entry)); }
+// Records each move up the chain once, timed when it actually happened. Returns true if anything changed.
+function runEscalations(h, now) {
+  now = now || Date.now();
+  let changed = false;
+  openItems(h, now).forEach(({ kind, item, st }) => {
+    if (st.serious && !item.ownerTold) {
+      item.ownerTold = true; changed = true;
+      logEsc(h, { ts: item.ts, from: '', to: 'Owner', kind: 'serious', text: 'Serious: ' + itemLabel(h, item, kind) + (item.injury ? ' (possible injury)' : '') + '. Owner told straight away by text.' });
+    }
+    const prev = item.escLvl || 0;
+    if (!st.taken && st.idx > prev) {
+      const at = kind === 'inc' ? [item.ts + (isSerious(item) ? HOUR : 4 * HOUR), item.ts + (isSerious(item) ? 2 : 8) * HOUR] : [new Date(item.due + 'T00:00:00').getTime() + DAY, new Date(item.due + 'T00:00:00').getTime() + 3 * DAY];
+      for (let l = prev + 1; l <= st.idx; l++) {
+        logEsc(h, { ts: at[l - 1], from: st.chain[l - 1], to: st.chain[l], kind: 'up', text: itemLabel(h, item, kind) + ' not done within ' + st.limit + '. Moved from ' + personName(h, st.chain[l - 1]) + ' to ' + personName(h, st.chain[l]) + '.' });
+      }
+      item.escLvl = st.idx; changed = true;
+    }
+  });
+  return changed;
+}
+// Sign-off scorecard: who has what, what's gone past them, how fast they review incidents.
+function scorecard(h, now) {
+  now = now || Date.now();
+  const items = openItems(h, now), m30 = now - 30 * DAY;
+  return SCORE_ROLES.map(role => {
+    const mine = items.filter(x => x.st.assigned === role || (x.st.rerouted && x.st.chain[0] === role && x.st.assigned === 'Manager'));
+    const rev = h.incidents.filter(i => i.reviewed && i.reviewedBy === role && i.reviewedTs >= m30);
+    const avg = rev.length ? rev.reduce((a, i) => a + (i.reviewedTs - i.ts), 0) / rev.length / HOUR : null;
+    const sentUp = (h.escLog || []).filter(e => e.kind === 'up' && e.from === role && e.ts >= m30).length;
+    return { role, open: mine.length, late: mine.filter(x => x.st.escalated).length, avg, reviewed: rev.length, sentUp };
+  }).filter(r => r.open || r.reviewed || r.sentUp || r.role === 'Manager');
+}
+const signer = h => S.role === 'manager' ? (h.managerOff ? 'Deputy' : 'Manager') : ({ owner: 'Owner', nurse: 'Nurse in charge', carer: 'Carer', cook: 'Cook' }[S.role] || 'Staff');
+// Adds people, the escalation log, the confidential inbox and a few live demo scenarios to a home.
+function setupEscalation(h, id) {
+  const now = Date.now();
+  h.people = PEOPLE[id] || { manager: 'Manager', deputy: 'Deputy' };
+  h.managerOff = false; h.escLog = h.escLog || []; h.speakUp = h.speakUp || [];
+  h.incidents.forEach(i => { if (i.reviewed && !i.reviewedBy) i.reviewedBy = incAssignee(i); });
+  const res = n => h.residents[n % h.residents.length];
+  const addInc = (r, type, sub, injury, text, hoursAgo, by) => {
+    const ts = now - hoursAgo * HOUR;
+    const inc = { id: uid(), ts, resId: r.id, type, sub, injury, text, by: by || 'Carer', reviewed: false };
+    const a = { id: uid(), title: 'Review ' + sub.toLowerCase() + ': ' + resName(r), detail: text, owner: incAssignee(inc), due: dayKey(ts + 2 * DAY), tag: 'New', done: false, created: ts };
+    inc.actionId = a.id; h.incidents.push(inc); h.actions.push(a);
+  };
+  if (id === 'stannes') {
+    addInc(res(4), 'Fall', 'Fall', false, 'Found sitting on the floor by the wardrobe at 08:10. No obvious injury. Helped up with the hoist.', 6);
+    addInc(res(17), 'Fall', 'Fall', true, 'Fell in the corridor near the lounge. Small cut above the left eyebrow, cleaned and dressed by the nurse. Observations normal.', 1.5);
+    h.speakUp.push({ id: uid(), ts: now - 2 * DAY, about: 'Records not being done properly', text: 'On nights we are being told to fill in the fluid and turning charts at the end of the shift from memory, not when we do them.', anon: true, by: 'Anonymous', status: 'new' });
+  } else if (id === 'overseal') {
+    addInc(res(9), 'Concern', 'Skin or pressure area', false, 'Red area on the right hip that did not fade after repositioning.', 7, 'Nurse');
+  }
+  h.escV = 1;
 }
 
 /* ---------------- UI ---------------- */
@@ -488,6 +606,9 @@ function renderTop() {
 }
 function render() {
   if (S.role !== 'owner' && S.homeId === 'all') S.homeId = S.lastHome;
+  let moved = false;
+  Object.values(S.homes).forEach(x => { if (runEscalations(x)) moved = true; });
+  if (moved) save();
   renderTop();
   let html = '';
   if (S.homeId === 'all') html = viewGroup();
@@ -506,8 +627,9 @@ const tile = (k, v, s, bad, act) => `<div class="tile"${act ? ` role="button" ta
 /* ----- Owner ----- */
 function attentionItems(h, st) {
   const items = [];
-  st.late.forEach(a => items.push({ tag: 'Late', cls: 'bad', html: `<b>${esc(a.title)}.</b> ${esc(a.detail)} Was due ${dueText(a.due)}.`, who: a.owner }));
-  h.incidents.filter(i => !i.reviewed).forEach(i => { const r = resById(h, i.resId); items.push({ tag: i.type === 'Fall' ? 'Fall' : 'Care', cls: 'bad', html: `<b>${esc(i.sub || i.type)}: ${esc(resName(r))}${i.injury ? ', possible injury' : ''}.</b> ${esc(i.text)} Logged ${whenText(i.ts)} by ${esc(i.by.toLowerCase())}.`, who: 'Manager to review' }); });
+  const linked = new Set(h.incidents.map(i => i.actionId).filter(Boolean));
+  st.late.filter(a => !linked.has(a.id)).forEach(a => { const e = escState(h, a, 'act'); items.push({ tag: 'Late', cls: 'bad', html: `<b>${esc(a.title)}.</b> ${esc(a.detail)} Was due ${dueText(a.due)}.`, who: e.holder === a.owner ? a.owner : 'With ' + personLow(h, e.holder) + ', was ' + personLow(h, a.owner) }); });
+  h.incidents.filter(i => !i.reviewed).forEach(i => { const r = resById(h, i.resId), e = escState(h, i, 'inc'); items.push({ tag: e.serious ? 'Serious' : (i.type === 'Fall' ? 'Fall' : 'Care'), cls: 'bad', html: `<b>${esc(i.sub || i.type)}: ${esc(resName(r))}${i.injury ? ', possible injury' : ''}.</b> ${esc(i.text)} Logged ${whenText(i.ts)} by ${esc(i.by.toLowerCase())}.`, who: (e.escalated ? 'Not reviewed in time \u00b7 now with ' : 'To review: ') + personLow(h, e.holder) }); });
   h.shifts.filter(s => s.cover === 'open').forEach(s => items.push({ tag: s.date === today() ? 'Today' : 'Rota', cls: s.role === 'Nurse' ? 'bad' : 'warn', html: `<b>${niceDate(new Date(s.date + 'T12:00').getTime())} ${esc(s.role.toLowerCase())} shift not covered (${esc(s.time)}).</b> ${s.texted ? 'Sent to bank staff at ' + hhmm(s.texted) + ', no reply yet.' : 'Not yet sent to bank staff.'}`, who: 'Manager' }));
   st.feesOpen.filter(f => Date.now() - f.since > 28 * DAY).forEach(f => items.push({ tag: 'Money', cls: 'warn', html: `<b>Fees ${Math.floor((Date.now() - f.since) / (7 * DAY))} weeks overdue (${money(f.amt)}).</b> ${esc(f.payer)}. Next step: call them.`, who: 'Admin' }));
   h.invoices.filter(i => i.rise && i.status === 'waiting').forEach(i => items.push({ tag: 'Price', cls: 'warn', html: `<b>${esc(i.supplier)}:</b> ${esc(i.rise)}.`, btns: `<button type="button" class="btn pri sm" data-act="inv" data-id="${i.id}" data-st="queried">Query it</button><button type="button" class="btn sm" data-act="inv" data-id="${i.id}" data-st="approved">Accept</button>` }));
@@ -542,6 +664,7 @@ function viewOwner() {
   </div>
   <div class="btns"><button type="button" class="btn" data-act="editFigures">Use your own numbers</button><button type="button" class="btn" data-act="report">Monthly ${h.reg} report</button><button type="button" class="btn" data-act="friday">Friday email</button></div>
   <section class="card"><h2>Needs your attention this week</h2><div>${att.length ? att.map(a => `<div class="att"><span class="tag ${a.cls}">${esc(a.tag)}</span><span class="txt">${a.html}</span>${a.btns ? `<span class="btns">${a.btns}</span>` : `<span class="who">${esc(a.who || '')}</span>`}</div>`).join('') : '<p class="empty">Nothing needs you this week.</p>'}</div></section>
+  ${escalationCard(h)}
   <div class="grid2 three">
     <section class="card"><h2>${esc(h.reg)} areas for improvement</h2>${aims}<p class="foot">From the care records and staff files. The monthly ${h.reg === 'CIW' ? 'Responsible Individual report' : 'quality report'} builds from these figures. Sign-offs on the Nurse screen move these bars.</p></section>
     <section class="card"><h2>Agency share, last 8 weeks</h2>
@@ -579,6 +702,51 @@ function viewOwner() {
   </div>
   <p class="demo-foot">Demo only: every figure is made up. In the real app each number comes from the home's own records, entered once by staff on a phone or tablet. Anything you add here is saved on this phone only.</p>`;
 }
+/* ----- escalations: owner's view ----- */
+function escalationCard(h) {
+  const now = Date.now(), items = openItems(h, now);
+  const up = items.filter(x => x.st.escalated || x.st.serious || x.st.taken).sort((a, b) => (b.st.serious - a.st.serious) || (b.st.idx - a.st.idx) || (a.st.since - b.st.since));
+  const soon = items.filter(x => !x.st.escalated && !x.st.taken && x.st.nextAt && x.st.nextAt - now < 4 * HOUR && x.kind === 'inc');
+  const row = ({ kind, item, st }) => {
+    const label = itemLabel(h, item, kind);
+    const tag = st.serious ? '<span class="tag bad">Serious</span>' : (st.taken ? '<span class="tag">With you</span>' : `<span class="tag ${st.holder === 'Owner' ? 'bad' : 'warn'}">${st.holder === 'Owner' ? 'With you' : 'Escalated'}</span>`);
+    const path = st.chain.map((r, i) => `<span class="${i === st.idx && !st.taken ? 'here' : (i < st.idx ? 'past' : '')}">${esc(personName(h, r))}</span>`).join('<span class="arr">→</span>');
+    const why = st.taken ? 'You took this over.' : (st.escalated ? `Not done within ${st.limit}. With ${esc(personLow(h, st.holder))} since ${kind === "act" ? niceDate(st.since) : whenText(st.since)}.` : `Within time. ${st.nextAt ? 'Goes to ' + esc(personLow(h, st.nextRole)) + ' at ' + hhmm(st.nextAt) + ' if not reviewed.' : ''}`);
+    const btns = st.holder === 'Owner' || st.taken
+      ? `<button type="button" class="btn pri sm" data-act="escDone" data-k="${kind}" data-id="${item.id}">${kind === 'inc' ? 'Mark reviewed' : 'Done'}</button>`
+      : `<button type="button" class="btn sm" data-act="escChase" data-k="${kind}" data-id="${item.id}">Chase</button><button type="button" class="btn pri sm" data-act="escTake" data-k="${kind}" data-id="${item.id}">Take it over</button>`;
+    return `<div class="att">${tag}<span class="txt"><b>${esc(label)}.</b> ${why}<br><span class="chain">${path}</span></span><span class="btns">${btns}</span></div>`;
+  };
+  const sc = scorecard(h, now);
+  const log = (h.escLog || []).slice().sort((a, b) => b.ts - a.ts).slice(0, 6);
+  const su = (h.speakUp || []).slice().sort((a, b) => b.ts - a.ts);
+  const suNew = su.filter(x => x.status === 'new').length;
+  return `<section class="card"><div class="card-h"><h2>Escalations: nothing gets stuck</h2><span class="hint">Today: ${h.managerOff ? `<b style="color:var(--warn)">${esc(personName(h, 'Manager'))} off</b>, ${esc(personLow(h, 'Deputy'))} covering` : esc(personName(h, 'Manager')) + ' on shift'}</span></div>
+    <p class="hint">Falls are reviewed within 4 hours, serious events (injury, safeguarding) within 1 hour and come to you straight away. Anything not done in time moves up: ${esc(personLow(h, 'Manager'))} → ${esc(personLow(h, 'Deputy'))} → you. To-dos move up the day after they're due.</p>
+    <div>${up.length ? up.map(row).join('') : '<p class="okbox">Nothing has gone past its time limit.</p>'}${soon.map(row).join('')}</div>
+  </section>
+  <div class="grid2">
+    <section class="card"><h2>Sign-offs by person, last 30 days</h2><div class="tbl-wrap"><table><thead><tr><th>Who</th><th class="n">Open</th><th class="n">Gone past them</th><th class="n">Avg time to review incidents</th><th class="n">Sent up</th></tr></thead><tbody>
+      ${sc.map(r => `<tr><td><b>${esc(personName(h, r.role))}</b></td><td class="n">${r.open}</td><td class="n" style="${r.late ? 'color:var(--bad);font-weight:600' : ''}">${r.late}</td><td class="n" style="${r.avg != null && r.avg > 24 ? 'color:var(--bad);font-weight:600' : ''}">${r.avg == null ? '—' : r.avg.toFixed(1) + ' hrs'}${r.reviewed ? ` <span class="hint">(${r.reviewed})</span>` : ''}</td><td class="n">${r.sentUp}</td></tr>`).join('')}
+    </tbody></table></div><p class="foot">Every review and sign-off is stamped with the person's PIN. A manager who lets things slide shows up here in the numbers.</p></section>
+    <section class="card"><div class="card-h"><h2>Raised in confidence</h2>${suNew ? `<span class="tag bad">${suNew} new</span>` : ''}</div>
+      <div>${su.map(x => `<div class="att"><span class="tag ${x.status === 'new' ? 'bad' : 'ok'}">${x.status === 'new' ? 'New' : 'Looked into'}</span><span class="txt"><b>${esc(x.about)}.</b> ${esc(x.text)}<br><span class="hint">${whenText(x.ts)} · ${x.anon ? 'name kept off' : esc(x.by)}</span></span>${x.status === 'new' ? `<button type="button" class="btn sm" data-act="speakDone" data-id="${x.id}">Looked into</button>` : ''}</div>`).join('') || '<p class="empty">Nothing raised.</p>'}</div>
+      <p class="foot">Any member of staff can send a concern straight to you${h.reg === 'CIW' ? ' as Responsible Individual' : ''}, including about the manager. The manager can't see this list.</p></section>
+  </div>
+  <section class="card"><h2>Escalation log</h2><div class="rows">${log.map(e => `<div class="row"><span class="grow">${esc(e.text)}</span><span class="hint" style="white-space:nowrap">${whenText(e.ts)}</span></div>`).join('') || '<p class="empty">Nothing yet.</p>'}</div><p class="foot">Demo: texts are not really sent.</p></section>`;
+}
+const speakUpBtn = () => `<button type="button" class="btn" data-act="speakUp">Raise a concern in confidence</button>`;
+function speakUpSheet() {
+  const h = H();
+  openSheet(`${sheetHead('Raise a concern in confidence', 'Goes straight to the owner' + (h.reg === 'CIW' ? ' (Responsible Individual)' : '') + '. The manager can’t see it.')}
+  <form class="form" data-form="speakUp">
+    <label class="fld"><span>What is it about</span><select name="about"><option>The manager or a senior</option><option>Care of a resident</option><option>Records not being done properly</option><option>Bullying or how staff are treated</option><option>Something else</option></select></label>
+    <label class="fld"><span>What's happening</span><textarea name="text" required placeholder="What you've seen, when, and who was there"></textarea></label>
+    <label class="check"><input type="checkbox" name="anon" checked> Keep my name off it</label>
+    <p class="hint">You can also go to ${h.reg === 'CIW' ? 'Care Inspectorate Wales' : 'the CQC'} directly at any time.</p>
+    <button class="btn pri" type="submit">Send to the owner</button>
+  </form>`);
+}
 function viewGroup() {
   const rows = Object.values(S.homes).map(h => { const st = stats(h); return { h, st }; });
   const tot = rows.reduce((a, { h, st }) => ({ beds: a.beds + h.beds, n: a.n + st.n, fees: a.fees + st.fees, acts: a.acts + st.openActs.length, late: a.late + st.late.length, lost: a.lost + st.lostFees }), { beds: 0, n: 0, fees: 0, acts: 0, late: 0, lost: 0 });
@@ -587,9 +755,10 @@ function viewGroup() {
     ${tile('Beds filled', tot.n + ' / ' + tot.beds, (tot.beds - tot.n) + ' empty \u00b7 ' + money(tot.lost) + ' a week')}
     ${tile('Fees overdue', money(tot.fees), 'Across ' + rows.length + ' homes')}
     ${tile('Open actions', String(tot.acts), tot.late + ' past their date', tot.late > 0)}
+    ${(() => { const n = rows.reduce((a, { h }) => a + openItems(h).filter(x => x.st.escalated || x.st.serious).length, 0); return tile('Escalated past the manager', String(n), 'Not done in time, or serious', n > 0); })()}
   </div>
-  <section class="card"><h2>Homes side by side</h2><div class="tbl-wrap"><table><thead><tr><th>Home</th><th>Rating</th><th class="n">Beds</th><th class="n">Agency</th><th class="n">Nurse own</th><th class="n">Food / day</th><th class="n">Fees overdue</th><th class="n">Actions</th></tr></thead><tbody>
-  ${rows.map(({ h, st }) => `<tr class="click" data-act="openHome" data-home="${h.id}"><td><b>${esc(h.name)}</b><br><span class="hint">${esc(h.town)}</span></td><td><span class="chip ${/Requires/.test(h.rating) ? 'warn' : 'ok'}">${esc(h.reg)} \u00b7 ${esc(h.rating)}</span></td><td class="n">${st.n}/${h.beds}</td><td class="n" style="${h.fig.agencyPct > h.fig.agencyTarget ? 'color:var(--bad);font-weight:600' : ''}">${h.fig.agencyPct}%</td><td class="n">${h.noNurses ? '\u2014' : st.nurseOwn + '/' + st.nurseTotal}</td><td class="n" style="${h.fig.foodPRD > h.fig.foodTarget ? 'color:var(--bad);font-weight:600' : ''}">${money2(h.fig.foodPRD)}</td><td class="n">${money(st.fees)}</td><td class="n">${st.openActs.length}${st.late.length ? ` <span style="color:var(--bad)">(${st.late.length} late)</span>` : ''}</td></tr>`).join('')}
+  <section class="card"><h2>Homes side by side</h2><div class="tbl-wrap"><table><thead><tr><th>Home</th><th>Rating</th><th class="n">Beds</th><th class="n">Agency</th><th class="n">Nurse own</th><th class="n">Food / day</th><th class="n">Fees overdue</th><th class="n">Actions</th><th class="n">Escalated</th></tr></thead><tbody>
+  ${rows.map(({ h, st }) => `<tr class="click" data-act="openHome" data-home="${h.id}"><td><b>${esc(h.name)}</b><br><span class="hint">${esc(h.town)}</span></td><td><span class="chip ${/Requires/.test(h.rating) ? 'warn' : 'ok'}">${esc(h.reg)} \u00b7 ${esc(h.rating)}</span></td><td class="n">${st.n}/${h.beds}</td><td class="n" style="${h.fig.agencyPct > h.fig.agencyTarget ? 'color:var(--bad);font-weight:600' : ''}">${h.fig.agencyPct}%</td><td class="n">${h.noNurses ? '\u2014' : st.nurseOwn + '/' + st.nurseTotal}</td><td class="n" style="${h.fig.foodPRD > h.fig.foodTarget ? 'color:var(--bad);font-weight:600' : ''}">${money2(h.fig.foodPRD)}</td><td class="n">${money(st.fees)}</td><td class="n">${st.openActs.length}${st.late.length ? ` <span style="color:var(--bad)">(${st.late.length} late)</span>` : ''}</td><td class="n">${(() => { const n = openItems(h).filter(x => x.st.escalated || x.st.serious).length, su = (h.speakUp || []).filter(x => x.status === 'new').length; return `<span style="${n ? 'color:var(--bad);font-weight:600' : ''}">${n}</span>${su ? ` <span class="hint">+${su} raised in confidence</span>` : ''}`; })()}</td></tr>`).join('')}
   </tbody></table></div><p class="foot">Red means worse than target. Every figure is made up for the demo.</p></section>`;
 }
 
@@ -603,7 +772,10 @@ function viewManager() {
     const unrev = h.incidents.filter(i => !i.reviewed).length, open = h.shifts.filter(s => s.cover === 'open').length;
     const d0 = startOfDay(Date.now());
     const flu = h.residents.filter(r => fluidToday(r) < r.fluidTarget * Math.min(1, Math.max(0, (Date.now() - (d0 + 7 * HOUR)) / (14 * HOUR))) * 0.6);
-    body = `<div class="tiles">${tile('Incidents to review', String(unrev), unrev ? 'Tap Incidents' : 'All reviewed', unrev > 0)}${tile('Shifts not covered', String(open), 'Next 7 days', open > 0)}${tile('Behind on fluids', String(flu.length), 'Under 60% of where they should be by now', flu.length > 3)}</div>
+    const past = openItems(h).filter(x => x.st.escalated && x.st.chain.indexOf('Manager') > -1 && x.st.chain.indexOf(x.st.holder) > x.st.chain.indexOf('Manager'));
+    body = `<section class="card"><div class="card-h"><h2>Who's on today</h2><div class="seg" role="group" aria-label="Manager on shift" style="margin:0"><button type="button" data-act="mgrOff" data-v="0" aria-pressed="${!h.managerOff}">${esc(h.people.manager)} on</button><button type="button" data-act="mgrOff" data-v="1" aria-pressed="${!!h.managerOff}">${esc(h.people.manager)} off</button></div></div><p class="hint">${h.managerOff ? `Taken from the rota. While ${esc(h.people.manager)} is off, falls, concerns and to-dos go straight to ${esc(personLow(h, 'Deputy'))}.` : `If ${esc(h.people.manager)} is off on the rota, everything goes to ${esc(personLow(h, 'Deputy'))} instead.`}</p></section>
+    ${past.length ? `<div class="notice"><b>${past.length} item${past.length > 1 ? 's have' : ' has'} gone past the manager</b> because ${past.length > 1 ? 'they weren\u2019t' : 'it wasn\u2019t'} done in time: ${past.map(x => esc(itemLabel(h, x.item, x.kind))).join('; ')}. The owner can see this.</div>` : ''}
+    <div class="tiles">${tile('Incidents to review', String(unrev), unrev ? 'Tap Incidents' : 'All reviewed', unrev > 0)}${tile('Shifts not covered', String(open), 'Next 7 days', open > 0)}${tile('Behind on fluids', String(flu.length), 'Under 60% of where they should be by now', flu.length > 3)}</div>
     <section class="card"><div class="card-h"><h2>To do</h2><button type="button" class="btn sm" data-act="addAction">Add a to-do</button></div><div>
     ${acts.map(a => `<div class="att"><span class="tag ${a.due < today() ? 'bad' : (a.tag === 'New' ? 'bad' : (a.tag ? 'warn' : ''))}">${a.due < today() ? 'Late' : esc(a.tag || 'Due ' + dueText(a.due).slice(0, 3))}</span><span class="txt"><b>${esc(a.title)}</b><br><span class="hint">${esc(a.detail)} \u00b7 ${esc(a.owner)} \u00b7 due ${dueText(a.due)}</span></span><button type="button" class="btn sm" data-act="doneAction" data-id="${a.id}">Done</button></div>`).join('') || '<p class="empty">Nothing on the list.</p>'}
     </div></section>
@@ -615,13 +787,14 @@ function viewManager() {
     ${h.noNurses ? '' : `<section class="card"><h2>Nurse shifts, next 7 days</h2><div class="tbl-wrap"><table><thead><tr><th>Day</th><th>Shift</th><th>Who</th></tr></thead><tbody>${shifts.filter(s => s.role === 'Nurse').map(s => `<tr><td>${niceDate(new Date(s.date + 'T12:00').getTime())}</td><td>${esc(s.time)}</td><td>${s.cover === 'open' ? '<span class="tag bad">Open</span>' : (s.cover === 'agency' ? '<span class="tag warn">Agency</span>' : esc(s.who))}</td></tr>`).join('')}</tbody></table></div><p class="foot">${st.nurseOwn} of ${st.nurseTotal} by own staff. This feeds the owner's dashboard.</p></section>`}`;
   } else if (sub === 'incidents') {
     const list = h.incidents.slice().sort((a, b) => b.ts - a.ts);
-    body = `<section class="card"><div class="card-h"><h2>Incidents</h2><button type="button" class="btn sm" data-act="concern">Log one</button></div><div>${list.map(i => { const r = resById(h, i.resId); return `<div class="att"><span class="tag ${i.reviewed ? 'ok' : 'bad'}">${i.reviewed ? 'Reviewed' : 'To review'}</span><span class="txt"><b>${esc(i.sub || i.type)}: ${esc(resName(r))}</b>${i.injury ? ' \u00b7 <span style="color:var(--bad)">possible injury</span>' : ''}<br><span class="hint">${esc(i.text)} \u00b7 ${whenText(i.ts)} by ${esc(i.by)}</span></span>${i.reviewed ? '' : `<button type="button" class="btn pri sm" data-act="review" data-id="${i.id}">Mark reviewed</button>`}</div>`; }).join('') || '<p class="empty">No incidents.</p>'}</div></section>`;
+    body = `<section class="card"><div class="card-h"><h2>Incidents</h2><button type="button" class="btn sm" data-act="concern">Log one</button></div><div>${list.map(i => { const r = resById(h, i.resId); return `<div class="att"><span class="tag ${i.reviewed ? 'ok' : 'bad'}">${i.reviewed ? 'Reviewed' : 'To review'}</span><span class="txt"><b>${esc(i.sub || i.type)}: ${esc(resName(r))}</b>${i.injury ? ' \u00b7 <span style="color:var(--bad)">possible injury</span>' : ''}<br><span class="hint">${esc(i.text)} \u00b7 ${whenText(i.ts)} by ${esc(i.by)}${i.reviewed ? (i.reviewedBy ? ' \u00b7 reviewed by ' + esc(personLow(h, i.reviewedBy)) + ' in ' + ((i.reviewedTs - i.ts) / HOUR).toFixed(1) + ' hrs' : '') : (() => { const e = escState(h, i, 'inc'); return ' \u00b7 ' + (e.escalated ? '<b style="color:var(--bad)">not reviewed in ' + e.limit + ', now with ' + esc(personLow(h, e.holder)) + '</b>' : 'review by ' + hhmm(e.nextAt || i.ts) + ' or it goes to ' + esc(personLow(h, e.nextRole || 'Owner'))); })()}</span></span>${i.reviewed ? '' : `<button type="button" class="btn pri sm" data-act="review" data-id="${i.id}">Mark reviewed</button>`}</div>`; }).join('') || '<p class="empty">No incidents.</p>'}</div></section>`;
   } else if (sub === 'enquiries') {
     body = `<section class="card"><div class="card-h"><h2>Enquiries</h2><button type="button" class="btn sm" data-act="addEnquiry">Add enquiry</button></div><div>${h.enquiries.slice().sort((a, b) => b.ts - a.ts).map(e => `<div class="att"><span class="tag ${/waiting/i.test(e.status) ? 'bad' : 'ok'}">${esc(e.from)}</span><span class="txt"><b>${esc(e.name)}</b><br><span class="hint">${esc(e.need)} \u00b7 ${whenText(e.ts)} \u00b7 ${esc(e.status)}</span></span>${/waiting/i.test(e.status) ? `<span class="btns"><button type="button" class="btn pri sm" data-act="enq" data-id="${e.id}" data-st="Assessment booked">Book assessment</button><button type="button" class="btn sm" data-act="enq" data-id="${e.id}" data-st="Declined, no suitable bed">Decline</button></span>` : ''}</div>`).join('')}</div></section>`;
   } else {
     body = `<section class="card"><h2>Invoices waiting</h2><div class="rows">${h.invoices.map(i => `<div class="row"><span class="grow">${esc(i.supplier)}${i.rise ? `<br><span class="hint" style="color:var(--warn)">${esc(i.rise)}</span>` : ''}</span><b class="num">${money(i.amt)}</b>${i.status === 'waiting' ? `<span class="btns"><button type="button" class="btn pri sm" data-act="inv" data-id="${i.id}" data-st="approved">Approve</button><button type="button" class="btn sm" data-act="inv" data-id="${i.id}" data-st="queried">Query</button></span>` : `<span class="tag ${i.status === 'approved' ? 'ok' : 'warn'}">${esc(i.status)}</span>`}</div>`).join('')}</div></section>
     <section class="card"><h2>Fees overdue</h2><div class="rows">${h.fees.map(fe => { const r = resById(h, fe.resId); return `<div class="row"><span class="grow">${esc(resName(r))} \u00b7 ${esc(fe.payer)}<br><span class="hint">${Math.round((Date.now() - fe.since) / (7 * DAY))} weeks overdue</span></span><b class="num">${money(fe.amt)}</b>${fe.paid ? '<span class="tag ok">Paid</span>' : `<button type="button" class="btn sm" data-act="feePaid" data-id="${fe.id}">Mark paid</button>`}</div>`; }).join('')}</div></section>`;
   }
+  body += `<div class="btns" style="margin-top:14px">${speakUpBtn()}</div>`;
   return `${homeHead(h, "Manager \u00b7 " + niceDate(Date.now()))}
   <div class="seg" role="group" aria-label="Manager sections">${tabs.map(([k, l]) => `<button type="button" data-act="sub" data-r="manager" data-s="${k}" aria-pressed="${sub === k}">${l}</button>`).join('')}</div>${body}`;
 }
@@ -651,7 +824,7 @@ function viewNurse() {
     const st = stats(h);
     body = `<section class="card"><div class="card-h"><h2>Care plan reviews to sign off</h2><b class="num">${st.plans} of ${st.n} current</b></div><div>${due.map(r => `<form class="att" data-form="review" data-id="${r.id}"><span class="txt"><b>${esc(resName(r))}</b> \u00b7 ${esc(unitName(h, r.unit))}, room ${r.room}<br><label class="check"><input type="checkbox" name="family" ${r.familyInvolved ? 'checked' : ''}> Family took part in this review</label></span><button class="btn pri sm" type="submit">Sign off review</button></form>`).join('') || '<p class="okbox">Every care plan is up to date.</p>'}</div><p class="foot">Signing off moves the ${esc(h.reg)} bars on the owner's dashboard straight away.</p></section>`;
   }
-  return `${homeHead(h, 'Nurse or senior \u00b7 ' + niceDate(Date.now()))}${unitSeg}<div class="seg" role="group" aria-label="Nurse sections">${tabs.map(([k, l]) => `<button type="button" data-act="sub" data-r="nurse" data-s="${k}" aria-pressed="${sub === k}">${l}</button>`).join('')}</div>${body}`;
+  return `${homeHead(h, 'Nurse or senior \u00b7 ' + niceDate(Date.now()))}${unitSeg}<div class="seg" role="group" aria-label="Nurse sections">${tabs.map(([k, l]) => `<button type="button" data-act="sub" data-r="nurse" data-s="${k}" aria-pressed="${sub === k}">${l}</button>`).join('')}</div>${body}<div class="btns" style="margin-top:14px">${speakUpBtn()}</div>`;
 }
 
 /* ----- Carer ----- */
@@ -662,7 +835,7 @@ function viewCarer() {
   const sample = res[0] ? res[0].first : 'Margaret';
   return `${homeHead(h, 'Carer \u00b7 my residents this shift')}${unitSeg}
   <div class="okbox">Press <b>Speak</b> and say what happened, e.g. \u201c${esc(sample)} drank 200 ml of tea and ate most of her lunch\u201d. It works out who, what and how much.</div>
-  <div class="btns"><button type="button" class="btn bad" data-act="concern">Report a fall or concern</button><button type="button" class="btn" data-act="addResident">Add a resident</button></div>
+  <div class="btns"><button type="button" class="btn bad" data-act="concern">Report a fall or concern</button><button type="button" class="btn" data-act="addResident">Add a resident</button>${speakUpBtn()}</div>
   <div class="res-list">${res.map(r => {
     const fl = fluidToday(r), pct = Math.min(100, fl / r.fluidTarget * 100), lt = lastTurn(r);
     const turnLate = r.needsTurns && (!lt || now - lt > 2 * HOUR);
@@ -705,7 +878,7 @@ function viewCook() {
     <section class="card"><h2>Order to send</h2><div class="rows">${ord.map(s => `<div class="row"><span>${esc(s.name)}</span><b class="num">${Math.max(1, s.par - s.qty)} ${esc(s.unit)}</b></div>`).join('') || '<p class="empty">Nothing ticked.</p>'}</div>
     ${h.orderSent ? `<p class="okbox">Order sent at ${hhmm(h.orderSent)} (demo: nothing actually sent).</p>` : `<button type="button" class="btn pri" data-act="sendOrder" ${ord.length ? '' : 'disabled'}>Send order</button>`}<p class="foot">In the live app the order is built from next week's menu and numbers, and invoices are checked against it.</p></section>`;
   }
-  return `${homeHead(h, 'Cook \u00b7 ' + niceDate(Date.now()))}<div class="seg" role="group" aria-label="Kitchen sections">${tabs.map(([k, l]) => `<button type="button" data-act="sub" data-r="cook" data-s="${k}" aria-pressed="${sub === k}">${l}</button>`).join('')}</div>${body}`;
+  return `${homeHead(h, 'Cook \u00b7 ' + niceDate(Date.now()))}<div class="seg" role="group" aria-label="Kitchen sections">${tabs.map(([k, l]) => `<button type="button" data-act="sub" data-r="cook" data-s="${k}" aria-pressed="${sub === k}">${l}</button>`).join('')}</div>${body}<div class="btns" style="margin-top:14px">${speakUpBtn()}</div>`;
 }
 
 /* ----- sheets ----- */
@@ -733,6 +906,8 @@ Agency: ${f.agencyPct}% of care hours (target ${f.agencyTarget}%)
 ${h.noNurses ? '' : 'Nurse shifts by own staff: ' + st.nurseOwn + ' of ' + st.nurseTotal + '\n'}Food: ${money2(f.foodPRD)} per resident per day (target ${money2(f.foodTarget)})
 Fees overdue: ${money(st.fees)}
 Open actions: ${st.openActs.length}, ${st.late.length} late
+Escalated past the manager: ${openItems(h).filter(x => x.st.escalated || x.st.serious).length}
+Raised in confidence: ${(h.speakUp || []).filter(x => x.status === 'new').length} new
 
 Needs you:
 ${att.map(a => '\u2022 ' + a.html.replace(/<[^>]+>/g, '')).join('\n')}</div>`);
@@ -1115,10 +1290,10 @@ function onClick(e) {
     case 'addResident': addResidentSheet(); break;
     case 'addAction': addActionSheet(); break;
     case 'addEnquiry': addEnquirySheet(); break;
-    case 'doneAction': { const a = h.actions.find(x => x.id === el.dataset.id); a.done = true; a.doneTs = Date.now(); const inc = h.incidents.find(i => i.actionId === a.id); if (inc) { inc.reviewed = true; inc.reviewedTs = Date.now(); } save(); render(); toast('Done'); break; }
+    case 'doneAction': { const a = h.actions.find(x => x.id === el.dataset.id); a.done = true; a.doneTs = Date.now(); a.doneBy = signer(h); const inc = h.incidents.find(i => i.actionId === a.id); if (inc) { inc.reviewed = true; inc.reviewedTs = Date.now(); inc.reviewedBy = signer(h); } save(); render(); toast('Done'); break; }
     case 'textBank': { const s = h.shifts.find(x => x.id === el.dataset.id); s.texted = Date.now(); save(); render(); toast('Demo: text would go to 4 bank staff'); break; }
     case 'cover': { const s = h.shifts.find(x => x.id === el.dataset.id); s.cover = el.dataset.c; s.who = s.cover === 'own' ? (s.role === 'Nurse' ? 'Bank nurse (own)' : 'Bank carer (own)') : 'Agency'; save(); render(); toast(s.cover === 'own' ? 'Covered by own staff' : 'Agency booked'); break; }
-    case 'review': { const i = h.incidents.find(x => x.id === el.dataset.id); i.reviewed = true; i.reviewedTs = Date.now(); const a = h.actions.find(x => x.id === i.actionId); if (a) a.done = true; save(); render(); toast('Marked reviewed'); break; }
+    case 'review': { const i = h.incidents.find(x => x.id === el.dataset.id); i.reviewed = true; i.reviewedTs = Date.now(); i.reviewedBy = signer(h); const a = h.actions.find(x => x.id === i.actionId); if (a) a.done = true; save(); render(); toast('Marked reviewed'); break; }
     case 'enq': { const q = h.enquiries.find(x => x.id === el.dataset.id); q.status = el.dataset.st; save(); render(); break; }
     case 'feePaid': { const fe = h.fees.find(x => x.id === el.dataset.id); fe.paid = true; save(); render(); toast('Marked paid'); break; }
     case 'mar': { const rd = UI.round || currentRound(), key = today() + ':' + rd; h.mar[key] = h.mar[key] || {}; const v = el.dataset.v; if (v) h.mar[key][el.dataset.k] = v; else delete h.mar[key][el.dataset.k];
@@ -1126,6 +1301,12 @@ function onClick(e) {
       save(); render(); break; }
     case 'orderTick': { const s = h.stock.find(x => x.id === el.dataset.id); s.order = el.checked; h.orderSent = null; save(); render(); break; }
     case 'sendOrder': h.orderSent = Date.now(); save(); render(); toast('Demo: order not really sent'); break;
+    case 'speakUp': speakUpSheet(); break;
+    case 'speakDone': { const x = h.speakUp.find(y => y.id === el.dataset.id); x.status = 'done'; x.doneTs = Date.now(); save(); render(); toast('Marked as looked into'); break; }
+    case 'mgrOff': { h.managerOff = el.dataset.v === '1'; logEsc(h, { ts: Date.now(), kind: 'rota', text: personName(h, 'Manager') + (h.managerOff ? ' marked off. ' + personName(h, 'Deputy') + ' now gets everything.' : ' back on shift.') }); save(); render(); toast(h.managerOff ? 'Deputy now covering' : 'Manager back on'); break; }
+    case 'escTake': { const it = el.dataset.k === 'inc' ? h.incidents.find(x => x.id === el.dataset.id) : h.actions.find(x => x.id === el.dataset.id); const e = escState(h, it, el.dataset.k); it.takenBy = 'Owner'; logEsc(h, { ts: Date.now(), kind: 'take', from: e.holder, to: 'Owner', text: 'Owner took over ' + itemLabel(h, it, el.dataset.k) + ' from ' + personLow(h, e.holder) + '.' }); save(); render(); toast('It\u2019s with you now'); break; }
+    case 'escChase': { const it = el.dataset.k === 'inc' ? h.incidents.find(x => x.id === el.dataset.id) : h.actions.find(x => x.id === el.dataset.id); const e = escState(h, it, el.dataset.k); logEsc(h, { ts: Date.now(), kind: 'chase', text: 'Owner chased ' + personLow(h, e.holder) + ' about ' + itemLabel(h, it, el.dataset.k) + '.' }); save(); render(); toast('Demo: text would go to ' + personLow(h, e.holder)); break; }
+    case 'escDone': { const now = Date.now(); if (el.dataset.k === 'inc') { const i = h.incidents.find(x => x.id === el.dataset.id); i.reviewed = true; i.reviewedTs = now; i.reviewedBy = 'Owner'; const a = h.actions.find(x => x.id === i.actionId); if (a) { a.done = true; a.doneTs = now; } logEsc(h, { ts: now, kind: 'done', text: itemLabel(h, i, 'inc') + ' reviewed by the owner.' }); } else { const a = h.actions.find(x => x.id === el.dataset.id); a.done = true; a.doneTs = now; a.doneBy = 'Owner'; logEsc(h, { ts: now, kind: 'done', text: a.title + ' closed by the owner.' }); } save(); render(); toast('Done'); break; }
     case 'resetAsk': openSheet(`${sheetHead('Reset demo data?')}<p>This clears everything added on this phone and puts the made-up data back.</p><div class="btns"><button type="button" class="btn bad" data-act="resetYes">Reset</button><button type="button" class="btn" data-act="closeSheet">Keep my changes</button></div>`); break;
     case 'resetYes': S = seedAll(); S.welcomed = true; save(); closeSheet(); render(); toast('Demo data reset'); break;
   }
@@ -1164,6 +1345,7 @@ function onSubmit(e) {
       const p = { type: kind === 'fall' ? 'fall' : 'concern', concern: kind, resId, injury: !!fd.get('injury'), text: g('text') };
       const msg = fileEntry(h, p, ROLE_PERSON[S.role] || 'Staff'); save(); closeSheet(); render(); toast(msg); break;
     }
+    case 'speakUp': h.speakUp = h.speakUp || []; h.speakUp.push({ id: uid(), ts: Date.now(), about: g('about'), text: g('text'), anon: !!fd.get('anon'), by: fd.get('anon') ? 'Anonymous' : (ROLE_PERSON[S.role] || 'Staff'), status: 'new' }); save(); closeSheet(); render(); toast('Sent to the owner only'); break;
     case 'action': addAction(h, g('title'), g('detail'), g('owner'), parseInt(g('days'), 10) || 7); save(); closeSheet(); render(); toast('Added'); break;
     case 'enquiry': h.enquiries.push({ id: uid(), ts: Date.now(), from: g('from'), name: g('name'), need: g('need'), status: g('status') }); save(); closeSheet(); render(); toast('Enquiry added'); break;
   }
@@ -1191,7 +1373,7 @@ function init() {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { splitLocal, parseSpeech, normalise, wordsToDigits, writeUp, tidy, seedAll, stats, findResident };
+  module.exports = { splitLocal, parseSpeech, normalise, wordsToDigits, writeUp, tidy, seedAll, stats, findResident, escState, openItems, runEscalations, scorecard, chainFor };
 } else {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 }
